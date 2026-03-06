@@ -24,12 +24,14 @@ pub fn main() !void {
     );
     defer posix.munmap(buffer);
 
-    loadProgram(buffer, &program_m2);
+    // loadProgram(buffer, &program_m2);
+    loadProgram(buffer, &program_m3);
 
     const map_ret = hv.hv_vm_map(buffer.ptr, 0x0, guest_mem_size, hv.HV_MEMORY_READ | hv.HV_MEMORY_EXEC);
     std.debug.print("map returned: 0x{x}\n", .{@as(u32, @bitCast(map_ret))});
 
-    execute(handler_m2);
+    // execute(handler_m2);
+    execute(handler_m3);
 }
 
 fn loadProgram(buffer: []u8, prog: []const u32) void {
@@ -85,6 +87,63 @@ fn handler_m2(vcpu: hv.hv_vcpu_t, exit: ?*hv.hv_vcpu_exit_t) void {
         if (done == 1) {
             std.debug.print("Loop completed\n", .{});
             return;
+        }
+    }
+}
+
+const program_m3 = [_]u32{
+    0xd2a00023, // mov x3, #0x1000
+    0x10000144, // adr x4, #40
+    0xd2800165, // mov x5, #11
+    0xd2800006, // mov x6, #0
+    0x38666880, // ldrb w0, [x4, x6]
+    0xf9000060, // str x0, [x3] -> trap to vmm
+    0x910004c6, // add x6, x6, #1
+    0xeb0500df, // cmp x6, x5
+    0x54ffff8b, // b.lt -4
+    0xd2800022, // mov x2, #1
+    0xd4000002, // hvc #0
+
+    // represents ascii "Hello VMM!\n"
+    0x6c6c6548, // ldnp d8, d25, [x10, #-0x140]
+    0x4d56206f, // .long 0x4d56206f
+    0x000a214d, // 0x6e0a214d
+};
+
+fn handler_m3(vcpu: hv.hv_vcpu_t, exit: ?*hv.hv_vcpu_exit_t) void {
+    while (true) {
+        _ = hv.hv_vcpu_run(vcpu);
+
+        switch (exit.?.reason) {
+            hv.HV_EXIT_REASON_EXCEPTION => {
+                const syndrome = exit.?.exception.syndrome;
+                switch (syndrome >> 26) {
+                    0x16 => {
+                        var done: u64 = undefined;
+                        _ = hv.hv_vcpu_get_reg(vcpu, hv.HV_REG_X2, &done);
+
+                        if (done == 1) {
+                            std.debug.print("\nGuest finished\n", .{});
+                            return;
+                        }
+                    },
+                    0x24 => {
+                        var val: u64 = undefined;
+                        _ = hv.hv_vcpu_get_reg(vcpu, hv.HV_REG_X0, &val);
+
+                        const char: u8 = @intCast(val & 0xFF);
+
+                        std.debug.print("{c}", .{char});
+
+                        var pc: u64 = undefined;
+
+                        _ = hv.hv_vcpu_get_reg(vcpu, hv.HV_REG_PC, &pc);
+                        _ = hv.hv_vcpu_set_reg(vcpu, hv.HV_REG_PC, pc + 4);
+                    },
+                    else => {},
+                }
+            },
+            else => {},
         }
     }
 }
