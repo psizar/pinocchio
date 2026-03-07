@@ -25,13 +25,15 @@ pub fn main() !void {
     defer posix.munmap(buffer);
 
     // loadProgram(buffer, &program_m2);
-    loadProgram(buffer, &program_m3);
+    // loadProgram(buffer, &program_m3);
+    loadProgram(buffer, &program_m4);
 
     const map_ret = hv.hv_vm_map(buffer.ptr, 0x0, guest_mem_size, hv.HV_MEMORY_READ | hv.HV_MEMORY_EXEC);
     std.debug.print("map returned: 0x{x}\n", .{@as(u32, @bitCast(map_ret))});
 
     // execute(handler_m2);
-    execute(handler_m3);
+    // execute(handler_m3);
+    execute(handler_m4);
 }
 
 fn loadProgram(buffer: []u8, prog: []const u32) void {
@@ -92,7 +94,7 @@ fn handler_m2(vcpu: hv.hv_vcpu_t, exit: ?*hv.hv_vcpu_exit_t) void {
 }
 
 const program_m3 = [_]u32{
-    0xd2a00023, // mov x3, #0x1000
+    0xd2a00023, // mov x3, #0x10000
     0x10000144, // adr x4, #40
     0xd2800165, // mov x5, #11
     0xd2800006, // mov x6, #0
@@ -104,7 +106,7 @@ const program_m3 = [_]u32{
     0xd2800022, // mov x2, #1
     0xd4000002, // hvc #0
 
-    // represents ascii "Hello VMM!\n"
+    // "Hello VMM!\n" as raw bytes
     0x6c6c6548, // ldnp d8, d25, [x10, #-0x140]
     0x4d56206f, // .long 0x4d56206f
     0x000a214d, // 0x6e0a214d
@@ -142,6 +144,85 @@ fn handler_m3(vcpu: hv.hv_vcpu_t, exit: ?*hv.hv_vcpu_exit_t) void {
                     },
                     else => {},
                 }
+            },
+            else => {},
+        }
+    }
+}
+
+// UART
+const program_m4 = [_]u32{
+    0xd2a12003, // mov x3, 0x9000000
+    0x100001a4, // adr x4, message
+    0xd2800185, // mov x5, #12
+    0xd2800006, // mov x6, #0
+    0xb9401861, // ldr w1, [x3, #0x18]
+    0x721b003f, // tst w1, #0x20
+    0x54ffffc1, // b.ne -2
+    0x38666880, // ldrb w0, [x4,x6]
+    0xb9000060, // str w0, [x3]
+    0x910004c6, // add x6, x6, #1
+    0xeb0500df, // cmp x6,x5
+    0x54ffff2b, // b.lt -7
+    0xd2800022, // mov x2, #1
+    0xd4000002, // hvc #0
+
+    // "Hello UART!\n" as raw bytes
+    0x6c6c6548,
+    0x4155206f,
+    0x0a215452,
+};
+
+fn handler_m4(vcpu: hv.hv_vcpu_t, exit: ?*hv.hv_vcpu_exit_t) void {
+    while (true) {
+        const stat = hv.hv_vcpu_run(vcpu);
+
+        if (stat != hv.HV_SUCCESS) {
+            std.debug.panic("unknown exit status. status: {d}\n", .{stat});
+        }
+
+        const reason = exit.?.reason;
+
+        if (reason != hv.HV_EXIT_REASON_EXCEPTION) {
+            std.debug.panic("unknown exit reason. reason: {d}\n", .{reason});
+        }
+
+        const syndrome = exit.?.exception.syndrome;
+
+        switch (syndrome >> 26) {
+            0x16 => {
+                var done: u64 = undefined;
+                _ = hv.hv_vcpu_get_reg(vcpu, hv.HV_REG_X2, &done);
+
+                if (done == 1) {
+                    std.debug.print("\nGuest finished\n", .{});
+                    return;
+                }
+            },
+            0x24 => {
+                const wnr = (syndrome >> 6) & 0x1;
+                const srt: u32 = @intCast((syndrome >> 16) & 0x1F);
+                const addr = exit.?.exception.physical_address;
+                switch (wnr) {
+                    // read
+                    0x0 => {
+                        _ = hv.hv_vcpu_set_reg(vcpu, hv.HV_REG_X0 + srt, 0x0);
+                    },
+                    // write
+                    else => {
+                        if (addr == 0x9_000_000) {
+                            var val: u64 = undefined;
+                            _ = hv.hv_vcpu_get_reg(vcpu, hv.HV_REG_X0 + srt, &val);
+
+                            const char: u8 = @intCast(val & 0xFF);
+
+                            std.debug.print("{c}", .{char});
+                        }
+                    },
+                }
+                var pc: u64 = undefined;
+                _ = hv.hv_vcpu_get_reg(vcpu, hv.HV_REG_PC, &pc);
+                _ = hv.hv_vcpu_set_reg(vcpu, hv.HV_REG_PC, pc + 4);
             },
             else => {},
         }
