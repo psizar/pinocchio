@@ -12,7 +12,7 @@ pub fn main() !void {
         @panic("failed to create VM");
     }
 
-    const guest_mem_size = std.heap.pageSize();
+    const guest_mem_size = 128 * 1024 * 1024;
 
     const buffer = try posix.mmap(
         null,
@@ -26,14 +26,33 @@ pub fn main() !void {
 
     // loadProgram(buffer, &program_m2);
     // loadProgram(buffer, &program_m3);
-    loadProgram(buffer, &program_m4);
+    // loadProgram(buffer, &program_m4);
 
-    const map_ret = hv.hv_vm_map(buffer.ptr, 0x0, guest_mem_size, hv.HV_MEMORY_READ | hv.HV_MEMORY_EXEC);
+    const kernel_offset = 0x200000; // 2MiB offset
+    const dtb_offset = 0x0; // DTB at base of RAM
+
+    // 1. Load DTB at the start of memory (0x40000000 in guest physical)
+    const dtb_size = try loadFile(buffer[dtb_offset..], "guest/pinocchio.dtb");
+    std.debug.print("Loaded DTB: {d} bytes\n", .{dtb_size});
+
+    // 2. Load Kernel at 2MB offset (0x40200000 in guest physical)
+    const kernel_size = try loadFile(buffer[kernel_offset..], "guest/vmlinuz");
+    std.debug.print("Loaded kernel: {d} bytes\n", .{kernel_size});
+
+    // 3. Map the entire 128MB into guest physical memory at 0x40000000
+    const map_ret = hv.hv_vm_map(buffer.ptr, 0x40000000, guest_mem_size, hv.HV_MEMORY_READ | hv.HV_MEMORY_WRITE | hv.HV_MEMORY_EXEC);
     std.debug.print("map returned: 0x{x}\n", .{@as(u32, @bitCast(map_ret))});
 
     // execute(handler_m2);
     // execute(handler_m3);
-    execute(handler_m4);
+    execute(kernel_handler);
+}
+
+fn loadFile(buffer: []u8, path: []const u8) !usize {
+    const file = try std.fs.cwd().openFile(path, .{});
+    defer file.close();
+
+    return try file.readAll(buffer);
 }
 
 fn loadProgram(buffer: []u8, prog: []const u32) void {
@@ -50,7 +69,8 @@ fn execute(func: fn (vcpu: hv.hv_vcpu_t, exit: ?*hv.hv_vcpu_exit_t) void) void {
     _ = hv.hv_vcpu_create(&vcpu, &exit, null);
     defer _ = hv.hv_vcpu_destroy(vcpu);
 
-    _ = hv.hv_vcpu_set_reg(vcpu, hv.HV_REG_PC, 0x0); // set to first instr
+    _ = hv.hv_vcpu_set_reg(vcpu, hv.HV_REG_X0, 0x40000000); // Address of DTB
+    _ = hv.hv_vcpu_set_reg(vcpu, hv.HV_REG_PC, 0x40200000); // Kernel entry point
     _ = hv.hv_vcpu_set_reg(vcpu, hv.HV_REG_CPSR, 0x3C4); // set exception level to EL1
 
     func(vcpu, exit);
@@ -225,6 +245,106 @@ fn handler_m4(vcpu: hv.hv_vcpu_t, exit: ?*hv.hv_vcpu_exit_t) void {
                 _ = hv.hv_vcpu_set_reg(vcpu, hv.HV_REG_PC, pc + 4);
             },
             else => {},
+        }
+    }
+}
+
+fn kernel_handler(vcpu: hv.hv_vcpu_t, exit: ?*hv.hv_vcpu_exit_t) void {
+    while (true) {
+        const stat = hv.hv_vcpu_run(vcpu);
+
+        if (stat != hv.HV_SUCCESS) {
+            std.debug.panic("VM Run failed. status: {d}\n", .{stat});
+        }
+
+        const reason = exit.?.reason;
+
+        switch (reason) {
+            hv.HV_EXIT_REASON_EXCEPTION => {
+                const syndrome = exit.?.exception.syndrome;
+                const ec = syndrome >> 26;
+
+                if (ec == 0x24) {
+                    const wnr = (syndrome >> 6) & 0x1;
+                    const srt: u32 = @intCast((syndrome >> 16) & 0x1F);
+                    const addr = exit.?.exception.physical_address;
+
+                    if (addr >= 0x09000000 and addr < 0x09001000) {
+                        if (wnr == 0) {
+                            _ = hv.hv_vcpu_set_reg(vcpu, hv.HV_REG_X0 + srt, 0x0);
+                        } else {
+                            if (addr == 0x09000000) {
+                                var val: u64 = undefined;
+                                _ = hv.hv_vcpu_get_reg(vcpu, hv.HV_REG_X0 + srt, &val);
+                                const char: u8 = @intCast(val & 0xFF);
+                                std.debug.print("{c}", .{char});
+                            }
+                        }
+                    } else if (addr >= 0x08000000 and addr < 0x09000000) {
+                        if (wnr == 0) {
+                            _ = hv.hv_vcpu_set_reg(vcpu, hv.HV_REG_X0 + srt, 0x0);
+                        }
+                    } else {
+                        std.debug.print("Unhanded MMIO: addr=0x{x}, isWrite={d}\n", .{ addr, wnr });
+                    }
+
+                    var pc: u64 = undefined;
+                    _ = hv.hv_vcpu_get_reg(vcpu, hv.HV_REG_PC, &pc);
+                    _ = hv.hv_vcpu_set_reg(vcpu, hv.HV_REG_PC, pc + 4);
+                } else if (ec == 0x16) {
+                    var x0: u64 = undefined;
+                    _ = hv.hv_vcpu_get_reg(vcpu, hv.HV_REG_X0, &x0);
+
+                    std.debug.print("[VMM] HVC call: x0=0x{x}\n", .{x0});
+
+                    const PSCI_0_2_FN_VERSION = 0x84000000;
+                    const PSCI_0_2_FN_CPU_ON = 0x84000003;
+                    const PSCI_0_2_FN_MIGRATE_INFO_TYPE = 0x84000006;
+                    const PSCI_0_2_FN_SYSTEM_OFF = 0x84000008;
+                    const PSCI_0_2_FN_SYSTEM_RESET = 0x84000009;
+
+                    const PSCI_RET_NOT_SUPPORTED: u64 = 0xFFFFFFFFFFFFFFFF;
+
+                    if (x0 == PSCI_0_2_FN_VERSION) {
+                        _ = hv.hv_vcpu_set_reg(vcpu, hv.HV_REG_X0, 2);
+                    } else if (x0 == PSCI_0_2_FN_SYSTEM_OFF or x0 == PSCI_0_2_FN_SYSTEM_RESET) {
+                        std.debug.print("\n[VM Shutdown via PSCI]\n", .{});
+                        return;
+                    } else if (x0 == PSCI_0_2_FN_CPU_ON) {
+                        _ = hv.hv_vcpu_set_reg(vcpu, hv.HV_REG_X0, PSCI_RET_NOT_SUPPORTED);
+                    } else if (x0 == PSCI_0_2_FN_MIGRATE_INFO_TYPE) {
+                        _ = hv.hv_vcpu_set_reg(vcpu, hv.HV_REG_X0, 2);
+                    } else {
+                        if ((x0 & 0xFFFFFF00) == 0x84000000 or (x0 & 0xFFFFFF00) == 0xC4000000) {
+                            _ = hv.hv_vcpu_set_reg(vcpu, hv.HV_REG_X0, PSCI_RET_NOT_SUPPORTED);
+                        } else {
+                            std.debug.print("Unhandled HVC: x0=0x{x}\n", .{x0});
+                        }
+                    }
+                } else if (ec == 0x18) {
+                    const is_write = (syndrome >> 0) & 0x1;
+                    const rt: u32 = @intCast((syndrome >> 5) & 0x1F);
+
+                    if (is_write == 0) {
+                        _ = hv.hv_vcpu_set_reg(vcpu, hv.HV_REG_X0 + rt, 0x0);
+                    }
+                    var pc: u64 = undefined;
+                    _ = hv.hv_vcpu_get_reg(vcpu, hv.HV_REG_PC, &pc);
+                    _ = hv.hv_vcpu_set_reg(vcpu, hv.HV_REG_PC, pc + 4);
+                } else if (ec == 0x01) {
+                    var pc: u64 = undefined;
+                    _ = hv.hv_vcpu_get_reg(vcpu, hv.HV_REG_PC, &pc);
+                    _ = hv.hv_vcpu_set_reg(vcpu, hv.HV_REG_PC, pc + 4);
+                } else {
+                    std.debug.print("[VMM] Unhandled EC=0x{x}, syndrome=0x{x}\n", .{ ec, syndrome });
+                    var pc: u64 = undefined;
+                    _ = hv.hv_vcpu_get_reg(vcpu, hv.HV_REG_PC, &pc);
+                    _ = hv.hv_vcpu_set_reg(vcpu, hv.HV_REG_PC, pc + 4);
+                }
+            },
+            else => {
+                std.debug.panic("Unhandled Exit Reason: {d}\n", .{reason});
+            },
         }
     }
 }
