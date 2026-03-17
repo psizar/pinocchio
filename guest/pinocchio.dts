@@ -1,0 +1,75 @@
+/dts-v1/;
+
+/ {
+    // 64-bit addresses, 32-bit sizes
+    #address-cells = <2>;
+    #size-cells = <1>;
+
+    // We emulate a fake hardware platform
+    compatible = "pinocchio,virt";
+
+    chosen {
+        // Tell Linux to use our PL011 UART for console output
+        stdout-path = "/uart@9000000";
+        // Explicitly set the kernel command line arguments
+        bootargs = "console=ttyAMA0 earlycon=pl011,0x09000000";
+    };
+
+    memory@40000000 {
+        device_type = "memory";
+        // Start at 0x40000000, Size 128MB (0x08000000)
+        reg = <0x0 0x40000000 0x08000000>;
+    };
+
+    cpus {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        cpu@0 {
+            device_type = "cpu";
+            compatible = "arm,arm-v8";
+            // CPU 0
+            reg = <0>;
+            // Tell Linux how to turn CPUs on/off
+            enable-method = "psci";
+        };
+    };
+
+    psci {
+        compatible = "arm,psci-0.2";
+        // "hvc" means Linux will use HVC instructions to call PSCI
+        method = "hvc";
+    };
+
+    // We must define an interrupt controller, even if we don't fully emulate it yet.
+    // Linux will crash early if it can't find one. GICv3 is standard for ARM64.
+    gic: interrupt-controller@8000000 {
+        compatible = "arm,gic-v3";
+        #interrupt-cells = <3>;
+        interrupt-controller;
+        reg = <0x0 0x08000000 0x010000>,   // GICD
+              <0x0 0x080A0000 0xF60000>;  // GICR
+        // We'll just ignore accesses to these addresses in our VMM for now
+    };
+
+    uart@9000000 {
+        // "arm,pl011" tells Linux which driver to load
+        compatible = "arm,pl011", "arm,primecell";
+        // Start at 0x09000000, Size 4KB
+        reg = <0x0 0x09000000 0x1000>;
+        interrupt-parent = <&gic>;
+        // A fake interrupt line (SPI 1)
+        interrupts = <0 1 4>;
+    };
+
+    // Generic timer required by ARM64
+    timer {
+        compatible = "arm,armv8-timer";
+        interrupt-parent = <&gic>;
+        // Secure, Non-secure, Virtual, and Hypervisor timer interrupts
+        interrupts = <1 13 4>,
+                     <1 14 4>,
+                     <1 11 4>,
+                     <1 10 4>;
+    };
+};
