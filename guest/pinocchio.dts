@@ -12,7 +12,9 @@
         // Tell Linux to use our PL011 UART for console output
         stdout-path = "/uart@9000000";
         // Explicitly set the kernel command line arguments
-        bootargs = "console=ttyAMA0 earlycon=pl011,0x09000000";
+        bootargs = "console=ttyAMA0 earlycon=pl011,mmio32,0x09000000 rdinit=/init";
+        linux,initrd-start = <0x0 0x44000000>;
+        linux,initrd-end = <0x0 0x440f9c8a>;
     };
 
     memory@40000000 {
@@ -60,6 +62,15 @@
         interrupt-parent = <&gic>;
         // A fake interrupt line (SPI 1)
         interrupts = <0 1 4>;
+        clocks = <&apb_pclk>;
+        clock-names = "apb_pclk";
+    };
+
+    apb_pclk: apb-pclk {
+        compatible = "fixed-clock";
+        #clock-cells = <0>;
+        clock-frequency = <24000000>;
+        clock-output-names = "clk24mhz";
     };
 
     // Generic timer required by ARM64
