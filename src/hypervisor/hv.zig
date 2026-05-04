@@ -92,7 +92,6 @@ pub fn vcpuSetVtimerMask(vcpu: u64, is_masked: bool) !void {
 }
 
 pub const HV_INTERRUPT_TYPE_IRQ: u32 = @intCast(hv.HV_INTERRUPT_TYPE_IRQ);
-pub const HV_INTERRUPT_TYPE_FIQ: u32 = @intCast(hv.HV_INTERRUPT_TYPE_FIQ);
 pub fn vcpuSetPendingInterrupt(vcpu: u64, int_type: u32, pending: bool) Error!void {
     try check(hv.hv_vcpu_set_pending_interrupt(vcpu, int_type, pending));
 }
