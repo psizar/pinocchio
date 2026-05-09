@@ -30,9 +30,23 @@ pub fn main(init: std.process.Init) !void {
 
                 switch (ec) {
                     0x24 => {
-                        const wnr = (syndrome >> 6) & 0x1;
+                        const isv = (syndrome >> 24) & 0x1;
+                        const sas: u2 = @intCast((syndrome >> 22) & 0x3);
+                        const sse = (syndrome >> 21) & 0x1;
                         const srt: u32 = @intCast((syndrome >> 16) & 0x1F);
+                        const sf = (syndrome >> 15) & 0x1;
+                        const wnr = (syndrome >> 6) & 0x1;
                         const addr = exit.exception.physical_address;
+
+                        _ = sse;
+                        _ = sf;
+
+                        if (isv == 0) {
+                            std.debug.print("[VMM] ec={}, ISV={} at addr=0x{x} - cannot decode syndrome skipping\n", .{ ec, isv, addr });
+                            const pc = try cpu.getReg(hv.HV_REG_PC);
+                            try cpu.setReg(hv.HV_REG_PC, pc + 4);
+                            continue;
+                        }
 
                         if (addr >= 0x09000000 and addr < 0x09001000) {
                             if (wnr == 0) {
@@ -40,11 +54,11 @@ pub fn main(init: std.process.Init) !void {
                                 const offset = addr - 0x09000000;
                                 if (offset == 0xFE0) val = 0x11 else if (offset == 0xFE4) val = 0x10 else if (offset == 0xFE8) val = 0x14 else if (offset == 0xFEC) val = 0x00 else if (offset == 0xFF0) val = 0x0D else if (offset == 0xFF4) val = 0xF0 else if (offset == 0xFF8) val = 0x05 else if (offset == 0xFFC) val = 0xB1 else if (offset == 0x018) val = 0x90; // UARTFR
 
-                                try cpu.setReg(REG_X0 + srt, val);
+                                try cpu.setReg(REG_X0 + srt, sasMask(sas, val));
                             } else {
                                 if (addr == 0x09000000) {
                                     const val: u64 = try cpu.getReg(REG_X0 + srt);
-                                    const char: u8 = @intCast(val & 0xFF);
+                                    const char: u8 = @truncate(sasMask(sas, val));
                                     std.debug.print("{c}", .{char});
                                 }
                             }
@@ -59,7 +73,7 @@ pub fn main(init: std.process.Init) !void {
                                     if (offset == 0xFFE8) gic_val = 0x3B; // GICR_PIDR2
                                     if (offset == 0x0008) gic_val = 0x10; // GICR_TYPER: Last=1
                                 }
-                                try cpu.setReg(REG_X0 + srt, gic_val);
+                                try cpu.setReg(REG_X0 + srt, sasMask(sas, gic_val));
                             }
                         } else {
                             std.debug.print("Unhanded MMIO: addr=0x{x}, isWrite={d}\n", .{ addr, wnr });
@@ -156,6 +170,15 @@ pub fn main(init: std.process.Init) !void {
             },
         }
     }
+}
+
+fn sasMask(sas: u2, val: u64) u64 {
+    return switch (sas) {
+        0 => val & 0xFF,
+        1 => val & 0xFFFF,
+        2 => val & 0xFFFFFFFF,
+        3 => val,
+    };
 }
 
 fn loadFile(io: std.Io, buffer: []u8, path: []const u8) !usize {
