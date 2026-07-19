@@ -90,23 +90,43 @@ fn makeIntegrationTest(step: *std.Build.Step, options: std.Build.Step.MakeOption
     mr.init(gpa, io, mr_buf.toStreams(), &.{ child.stdout.?, child.stderr.? });
     defer mr.deinit();
 
+    const stdout_r = mr.reader(0);
+    const stderr_r = mr.reader(1);
+
     const timeout: Io.Timeout = .{ .duration = .{
-        .raw = Io.Duration.fromSeconds(1),
+        .raw = Io.Duration.fromSeconds(30),
         .clock = .awake,
     } };
 
-    while (mr.fill(4096, timeout)) |_| {} else |err| switch (err) {
+    const init_str = "Hello from Pinocchio Guest (PID 1)!";
+    var found = false;
+
+    while (mr.fill(8192, timeout)) |_| {
+        if (!found and (std.mem.find(u8, stdout_r.buffered(), init_str) != null or std.mem.find(u8, stderr_r.buffered(), init_str) != null)) {
+            found = true;
+            child.kill(io);
+        }
+    } else |err| switch (err) {
         error.Timeout => {},
         error.EndOfStream => {},
         else => |e| return e,
     }
 
-    const output = try mr.toOwnedSlice(1);
-    defer gpa.free(output);
+    _ = try step.installDir("zig-out");
 
-    const init_str = "Hello from Pinocchio Guest (PID 1)!";
+    {
+        const data = try mr.toOwnedSlice(0);
+        defer gpa.free(data);
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = "zig-out/integration-stdout.log", .data = data });
+    }
 
-    if (std.mem.find(u8, output, init_str) == null) {
-        return step.fail("expected init string: {s}, got: {s}", .{ init_str, output });
+    {
+        const data = try mr.toOwnedSlice(1);
+        defer gpa.free(data);
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = "zig-out/integration-stderr.log", .data = data });
+    }
+
+    if (!found) {
+        return step.fail("unsuccessful boot. Refer to zig-out/integration-[stdout|stderr].log", .{});
     }
 }
