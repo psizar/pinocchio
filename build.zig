@@ -93,40 +93,67 @@ fn makeIntegrationTest(step: *std.Build.Step, options: std.Build.Step.MakeOption
     const stdout_r = mr.reader(0);
     const stderr_r = mr.reader(1);
 
-    const timeout: Io.Timeout = .{ .duration = .{
-        .raw = Io.Duration.fromSeconds(30),
-        .clock = .awake,
-    } };
-
     const init_str = "Hello from Pinocchio Guest (PID 1)!";
     var found = false;
+    var term: enum { deadline_hit, eos, fill_err } = .deadline_hit;
 
-    while (mr.fill(8192, timeout)) |_| {
-        if (!found and (std.mem.find(u8, stdout_r.buffered(), init_str) != null or std.mem.find(u8, stderr_r.buffered(), init_str) != null)) {
+    const start = Io.Clock.awake.now(io);
+    const timeout_s: i64 = 60;
+    const deadline = start.addDuration(Io.Duration.fromSeconds(timeout_s));
+    const deadline_ts: Io.Clock.Timestamp = .{ .raw = deadline, .clock = .awake };
+
+    while (true) {
+        if (Io.Clock.awake.now(io).nanoseconds >= deadline.nanoseconds) break;
+
+        mr.fill(8192, .{ .deadline = deadline_ts }) catch |err| switch (err) {
+            error.Timeout => break,
+            error.EndOfStream => {
+                term = .eos;
+                if (std.mem.find(u8, stdout_r.buffered(), init_str) != null or
+                    std.mem.find(u8, stderr_r.buffered(), init_str) != null) found = true;
+                break;
+            },
+            else => {
+                term = .fill_err;
+                break;
+            },
+        };
+
+        if (std.mem.find(u8, stdout_r.buffered(), init_str) != null or
+            std.mem.find(u8, stderr_r.buffered(), init_str) != null)
+        {
             found = true;
-            child.kill(io);
+            break;
         }
-    } else |err| switch (err) {
-        error.Timeout => {},
-        error.EndOfStream => {},
-        else => |e| return e,
     }
 
-    _ = try step.installDir("zig-out");
-
+    const out_dir = step.owner.install_path;
+    _ = try step.installDir(out_dir);
     {
-        const data = try mr.toOwnedSlice(0);
-        defer gpa.free(data);
-        try Io.Dir.cwd().writeFile(io, .{ .sub_path = "zig-out/integration-stdout.log", .data = data });
+        const stdout_path = step.owner.pathJoin(&.{ out_dir, "integration-stdout.log" });
+        if (mr.toOwnedSlice(0)) |data| {
+            defer gpa.free(data);
+            _ = try Io.Dir.cwd().writeFile(io, .{ .sub_path = stdout_path, .data = data });
+        } else |_| {}
     }
 
     {
-        const data = try mr.toOwnedSlice(1);
-        defer gpa.free(data);
-        try Io.Dir.cwd().writeFile(io, .{ .sub_path = "zig-out/integration-stderr.log", .data = data });
+        const stderr_path = step.owner.pathJoin(&.{ out_dir, "integration-stderr.log" });
+        if (mr.toOwnedSlice(1)) |data| {
+            defer gpa.free(data);
+            _ = try Io.Dir.cwd().writeFile(io, .{ .sub_path = stderr_path, .data = data });
+        } else |_| {}
     }
 
-    if (!found) {
-        return step.fail("unsuccessful boot. Refer to zig-out/integration-[stdout|stderr].log", .{});
-    }
+    if (found) return;
+
+    try mr.checkAnyError();
+
+    const msg = switch (term) {
+        .deadline_hit => step.owner.fmt("timed out after {d}s waiting for init string", .{timeout_s}),
+        .eos => "child exited before producing init string",
+        .fill_err => "reader error (see zig-out/integration-stderr.log)",
+    };
+
+    return step.fail("{s}", .{msg});
 }
